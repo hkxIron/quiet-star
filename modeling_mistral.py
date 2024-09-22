@@ -17,6 +17,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+这个是非MOE版本
+"""
+
 """ PyTorch Mistral model."""
 import inspect
 import math
@@ -1167,6 +1171,8 @@ class MistralForCausalLM(MistralPreTrainedModel):
         self.model = MistralModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # 下面的都是quiet-star
         self.max_thoughts = config.max_thoughts
         self.merged_lm_and_talk_heads = config.merged_lm_and_talk_heads
         self.use_concat_talk_head = config.use_concat_talk_head
@@ -1318,6 +1324,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
         # Append the start thought token to the input sequence
         start_thought_token_id = self.tokenizer.convert_tokens_to_ids("<|startthought|>")
         input_ids = torch.cat([input_ids, torch.tensor([[start_thought_token_id]] * batch_size).to(input_ids.device)], dim=-1)
+
         seq_len += 1
 
         # Update the attention mask
@@ -1346,8 +1353,15 @@ class MistralForCausalLM(MistralPreTrainedModel):
             hidden_states = outputs[0]
 
             logits = self.lm_head(hidden_states)
-            logits = logits[:, -1, :]  # Only consider the last token
+            logits = logits[:, -1, :]  # Only consider the last token, 只取最后一个token
 
+            """
+            Gumbel Softmax通过τ→0
+            的退火来逐渐逼近one hot，相比直接用原始的Softmax进行退火，
+            区别在于原始Softmax退火只能得到最大值位置为1的one hot向量，
+            而Gumbel Softmax有概率得到非最大值位置的one hot向量，
+            增加了随机性，会使得基于采样的训练更充分一些。
+            """
             # Apply Gumbel-Softmax to the logits
             next_token_logits = F.gumbel_softmax(logits, tau=self.gumbel_temperature, hard=True, dim=-1)
             next_token_id = torch.argmax(next_token_logits, dim=-1)
@@ -1381,11 +1395,14 @@ class MistralForCausalLM(MistralPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        hidden_states_before = outputs_before[0][:, -1:, :]
+        hidden_states_before = outputs_before[0][:, -1:, :] # [batch, T=1, dim]
 
         # two new tokens: last continuation token and end thought token
-        outputs_after = self.model(
-            input_ids=torch.cat([next_token_id.unsqueeze(-1).to(input_ids.device), torch.tensor(end_thought_token_id).unsqueeze(-1).unsqueeze(-1).to(input_ids.device)], dim=-1),
+        input_ids_with_talk_token = torch.cat([next_token_id.unsqueeze(-1).to(input_ids.device),
+                                               torch.tensor(end_thought_token_id).unsqueeze(-1).unsqueeze(-1).to(input_ids.device)
+                                               ], dim=-1)
+        outputs_after = self.model.forward(
+            input_ids=input_ids_with_talk_token,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=new_key_values,
@@ -1395,7 +1412,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        hidden_states_after = outputs_after[0][:, -1:, :]
+        hidden_states_after = outputs_after[0][:, -1:, :] # [batch, T=1, dim]
 
         # Apply the talk head to get the mixing weight
         mixing_weight = self.talk_head[0](torch.cat([hidden_states_before, hidden_states_after], dim=-1))
@@ -1528,7 +1545,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
                 self.end_embedding.data[1] = torch.log(self.model.embed_tokens.weight.data.std(dim=0) * self.thought_init_std_scale / self.embedding_scale)
 
         if not self.rm_initialized and (self.n_ahead > 1 or not self.base_original_mode):
-            self.rm_initialized = True                        
+            self.rm_initialized = True
             if not self.use_shallow_talk:
                 head = self.talk_head[0]
                 cur_head = head[-1] if isinstance(head, nn.Sequential) else head
